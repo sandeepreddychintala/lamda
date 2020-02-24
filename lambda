@@ -1,0 +1,507 @@
+import ipaddress
+
+import boto3
+
+from urllib.parse import urlencode
+
+from urllib.request import urlopen, Request, HTTPError, URLError
+
+import json
+
+class PyVPCBlock(object):
+
+    network = None
+
+    prefix_length = None
+
+    start_address = None
+
+    end_address = None
+
+    resource_id = None
+
+    name = None
+
+    resource_type = None
+
+    num_of_addresses = 0
+
+    block_available = False
+
+
+
+    def __init__(self, network=None, start_address=None, end_address=None, resource_id=None,
+
+                 resource_type=None, block_available=False):
+
+        if network is None and (start_address is None or end_address is None):
+
+            raise ValueError("network or start-end addresses should be provided")
+
+
+
+        if network:
+
+            self.network = network
+
+            self.prefix_length = network.prefixlen
+
+            self.start_address = network.network_address
+
+            self.end_address = network.broadcast_address
+
+            self.num_of_addresses = network.num_addresses
+
+        else:
+
+            self.start_address = start_address
+
+            self.end_address = end_address
+
+            self.num_of_addresses = int(end_address) - int(start_address) + 1
+
+
+
+        self.resource_id = resource_id
+
+        self.resource_type = resource_type
+
+        self.block_available = block_available
+
+
+
+    def get_id(self):
+
+        return self.resource_id
+
+
+
+    def get_type(self):
+
+        return self.resource_type
+
+
+
+    def get_network(self):
+
+        return self.network
+
+
+
+    def get_network_prefix(self):
+
+        return self.prefix_length
+
+
+
+    def get_start_address(self):
+
+        return self.start_address
+
+
+
+    def get_end_address(self):
+
+        return self.end_address
+
+
+
+    def get_num_addresses(self):
+
+        return self.num_of_addresses
+
+
+
+
+
+def return_pyvpc_objects_json(pyvpc_objects):
+
+    from json import dumps
+
+    result = []
+
+    for pyvpc_object in pyvpc_objects:
+
+        result.append(str(pyvpc_object.get_start_address()) + "/" + pyvpc_object.get_network_prefix())
+
+    return dumps({'ranges': result[-1]})
+
+
+
+
+
+
+
+def get_aws_vpc_if_exists(vpc_id_name, pri_or_sec):
+
+    response = boto3.client('ec2').describe_vpcs(
+
+        Filters=[
+
+            {
+
+                'Name': 'vpc-id',
+
+                'Values': [
+
+                    vpc_id_name,
+
+                ]
+
+            },
+
+        ],
+
+    )['Vpcs']
+
+    if pri_or_sec == "primary":
+
+        vpc_cidr = ipaddress.ip_network(response[0]['CidrBlock'])
+
+    else:
+
+        vpc_cidr = ipaddress.ip_network(response[0]['CidrBlockAssociationSet'][0]['CidrBlock'])
+
+    vpc_id = response[0]['VpcId']
+
+    return PyVPCBlock(network=vpc_cidr, resource_id=vpc_id, resource_type='vpc')
+
+
+
+    
+
+
+
+def get_aws_reserved_subnets(vpc_id):
+
+    response = boto3.client('ec2').describe_subnets(
+
+        Filters=[
+
+            {
+
+                'Name': 'vpc-id',
+
+                'Values': [
+
+                    vpc_id,
+
+                ]
+
+            }
+
+        ])['Subnets']
+
+
+
+    reserved_subnets = []
+
+    for subnet in response:
+
+        reserved_subnets.append(PyVPCBlock(network=ipaddress.ip_network(subnet['CidrBlock']),
+
+                                           resource_id=subnet['SubnetId'],
+
+                                           resource_type='subnet'))
+
+    return reserved_subnets
+
+
+
+
+
+def get_available_networks(desired_cidr, reserved_networks):
+
+    if not reserved_networks:
+
+        return [PyVPCBlock(network=desired_cidr,
+
+                           block_available=True)]
+
+    reserved_networks = sorted(reserved_networks, key=lambda x: x.network, reverse=False)
+
+
+
+    networks_result = []
+
+    range_head = desired_cidr[0]
+
+    range_tail = desired_cidr[-1]
+
+    for reserved_net in reserved_networks:
+
+        if desired_cidr.overlaps(reserved_net.get_network()):
+
+            if range_head < reserved_net.get_start_address():
+
+                networks_result.append(PyVPCBlock(start_address=range_head,
+
+                                                  end_address=reserved_net.get_start_address() - 1,
+
+                                                  block_available=True,
+
+                                                  resource_type='available block'))
+
+            networks_result.append(PyVPCBlock(network=reserved_net.get_network(), resource_id=reserved_net.get_id(),
+
+                                              ))
+
+            if reserved_net.get_end_address() >= range_tail:
+
+                break
+
+            else:  
+
+                if range_head < reserved_net.get_end_address():
+
+                    range_head = reserved_net.get_end_address() + 1
+
+            if reserved_networks.index(reserved_net) == len(reserved_networks) - 1:
+
+                networks_result.append(PyVPCBlock(start_address=range_head,
+
+                                                  end_address=range_tail,
+
+                                                  block_available=True))
+
+
+
+    if not networks_result:
+
+        networks_result.append(PyVPCBlock(network=desired_cidr, block_available=True))
+
+        return networks_result
+
+    return networks_result
+
+
+
+
+
+def calculate_suggested_cidr(ranges, prefix):
+
+    possible_subnets = []
+
+    for net_range in ranges:
+
+        if net_range.block_available:
+
+            possible_networks = []
+
+            net_cidr = ipaddress.summarize_address_range(net_range.get_start_address(), net_range.get_end_address())
+
+            try: 
+
+                for net in net_cidr:
+
+                    possible_networks.append(net)
+
+            except TypeError as exc:
+
+                raise TypeError('error converting {} and {} to cidr, '.format(net_range.get_start_address(),
+
+                                                                            net_range.get_end_address()) + str(exc))
+
+            except ValueError as exc:
+
+                raise TypeError('error converting {} and {} to cidr, '.format(net_range.get_start_address(),
+
+                                                                            net_range.get_end_address()) + str(exc))
+
+            for network in possible_networks:
+
+                if prefix:
+
+                    try:
+
+                        network_subnets = network.subnets(new_prefix=prefix)
+
+                        for sub in network_subnets:
+
+                            possible_subnets.append(PyVPCBlock(network=sub, block_available=True))
+
+                    except ValueError as exc:
+
+                        continue
+
+                else:
+
+                    possible_subnets.append(PyVPCBlock(network=network, block_available=True))
+
+    return possible_subnets
+
+
+
+def parse_size(size):
+
+    if isinstance(size, int):
+
+        return size
+
+
+
+    elif isinstance(size, str) and size.isdigit():
+
+        return int(size)
+
+
+
+    return None
+
+
+
+def sizes_valid(sizes):
+
+    """
+
+    Validate the subnet masks
+
+    """
+
+    return all(isinstance(size, int) and size >= 16 and size <= 28 for size in sizes)
+
+
+
+def send_response(event, context, response_status, reason=None, response_data={}):
+
+    body = {
+
+        "Status": response_status,
+
+        "PhysicalResourceId": context.log_stream_name,
+
+        "StackId": event["StackId"],
+
+        "RequestId": event["RequestId"],
+
+        "LogicalResourceId": event["LogicalResourceId"],
+
+    }
+
+
+
+    print("Responding: {}".format(response_status))
+
+
+
+    if reason:
+
+        print(reason)
+
+        body["Reason"] = reason
+
+
+
+    if response_data:
+
+        print(response_data)
+
+        body["Data"] = response_data
+
+
+
+    body = json.dumps(body).encode("utf-8")
+
+
+
+    req = Request(event["ResponseURL"], data=body, headers={
+
+        "Content-Length": len(body),
+
+        "Content-Type": "",
+
+    })
+
+    req.get_method = lambda: "PUT"
+
+
+
+    try:
+
+        urlopen(req)
+
+        return True
+
+    except HTTPError as e:
+
+        print("Failed executing HTTP request: {}".format(e.code))
+
+        return False
+
+    except URLError as e:
+
+        print("Failed to reach the server: {}".format(e.reason))
+
+        return False
+
+
+
+
+
+def handler(event, context, responder=send_response):
+
+    if event["RequestType"] == "Delete":
+
+        return responder(event, context, "SUCCESS")
+
+
+
+    properties = event.get("ResourceProperties", {})
+
+
+
+    missing = [param for param in ("VpcId", "Sizes") if param not in properties]
+
+
+
+    if missing:
+
+        return responder(event, context, "FAILED", reason="Missing parameter(s): {}".format(", ".join(missing)))
+
+    vpc_id = properties["VpcId"]
+
+    sizes = properties["Sizes"]
+
+    pri_or_sec = properties["pri_or_sec"]
+
+    network = get_aws_vpc_if_exists(vpc_id, pri_or_sec)
+
+    reserved_cidrs = get_aws_reserved_subnets(network.get_id())
+
+    suggested_net = []
+
+    i = 0
+
+    response_net = []
+
+    for size in sizes:
+
+        i = i + 1
+
+        pyvpc_objects = get_available_networks(network.get_network(), reserved_cidrs)
+
+        suggested_net.append(calculate_suggested_cidr(pyvpc_objects, size))
+
+        for snet in suggested_net:
+
+            result = []
+
+            for pyvpc_object in snet:
+
+                result.append(str(pyvpc_object.get_start_address()) + "/" + str(pyvpc_object.get_network_prefix()))
+
+        reserved_cidrs.append(PyVPCBlock(network=ipaddress.ip_network(result[-1]),
+
+                                        resource_id=None,
+
+                                        resource_type='subnet'))
+
+        response_net["CidrBlock" + str(i)] = result[-1]
+
+    return responder(event, context, "SUCCESS", response_data=response_net)
+
+
+
+if __name__ == "main":
+
+    handler(1,1)
